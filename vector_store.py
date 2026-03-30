@@ -81,7 +81,7 @@ class VectorStore:
     def search(
         self,
         query_vector: np.ndarray,
-        top_k: int = 5,
+        top_k: int = 10,
     ) -> list[SearchResult]:
         """
         Return the top-k most similar documents to a query vector.
