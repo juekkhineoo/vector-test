@@ -1,12 +1,23 @@
 """
-In-memory vector store with FAISS-backed similarity search.
+PostgreSQL + pgvector-backed vector store.
+
+Requires:
+  - PostgreSQL with the pgvector extension installed.
+  - psycopg2-binary and pgvector Python packages.
+
+Connection string format:
+    postgresql://user:password@host:port/dbname
 """
 
 from __future__ import annotations
+
+import json
+
 import numpy as np
-import faiss
+import psycopg2
+from psycopg2.extras import execute_values
+from pgvector.psycopg2 import register_vector
 from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass
@@ -19,26 +30,64 @@ class SearchResult:
 
 class VectorStore:
     """
-    Simple vector store that keeps texts, metadata, and a FAISS index in memory.
-    Supports add, search, save, and load operations.
+    Vector store backed by PostgreSQL + pgvector.
+
+    Documents are persisted in a 'documents' table with a vector column.
+    Similarity search uses cosine distance via the <=> operator.
     """
 
-    def __init__(self, embedding_dim: int, metric: str = "cosine"):
+    def __init__(self, conn_str: str, embedding_dim: int):
         """
         Args:
+            conn_str:      PostgreSQL connection string.
             embedding_dim: Dimensionality of the embedding vectors.
-            metric:        'cosine' (inner product on normalised vecs) or 'l2'.
         """
         self.embedding_dim = embedding_dim
-        self.metric = metric
+        self.conn = psycopg2.connect(conn_str)
+        self.is_new: bool = self._init_table()  # CREATE EXTENSION + table; True = first run
+        register_vector(self.conn)              # register vector type OID with psycopg2
 
-        if metric == "cosine":
-            self.index = faiss.IndexFlatIP(embedding_dim)   # inner-product = cosine for L2-normed vecs
-        else:
-            self.index = faiss.IndexFlatL2(embedding_dim)
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
 
-        self.texts: list[str] = []
-        self.metadata: list[dict] = []
+    def _init_table(self) -> bool:
+        """
+        Create the pgvector extension and documents table if absent.
+
+        Returns:
+            True  — table was just created (first run).
+            False — table already existed.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            # Check whether the table already exists before creating it
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name   = 'documents'
+                );
+            """)
+            already_existed: bool = cur.fetchone()[0]
+
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id        SERIAL PRIMARY KEY,
+                    text      TEXT    NOT NULL,
+                    metadata  JSONB,
+                    embedding vector({self.embedding_dim})
+                );
+            """)
+            # HNSW index for fast approximate cosine search.
+            # Works at any table size (unlike IVFFlat which needs a minimum row count).
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS documents_embedding_hnsw_idx
+                ON documents USING hnsw (embedding vector_cosine_ops);
+            """)
+        self.conn.commit()
+        return not already_existed
 
     # ------------------------------------------------------------------
     # Mutating operations
@@ -51,7 +100,7 @@ class VectorStore:
         metadata: list[dict] | None = None,
     ) -> None:
         """
-        Add pre-computed vectors and their source texts to the store.
+        Bulk-insert vectors and their source texts into the database.
 
         Args:
             vectors:  float32 array of shape (N, embedding_dim).
@@ -64,15 +113,24 @@ class VectorStore:
         if metadata is None:
             metadata = [{} for _ in texts]
 
-        self.index.add(vectors)
-        self.texts.extend(texts)
-        self.metadata.extend(metadata)
+        rows = [
+            (text, json.dumps(meta), vec.tolist())
+            for text, meta, vec in zip(texts, metadata, vectors)
+        ]
+        with self.conn.cursor() as cur:
+            execute_values(
+                cur,
+                "INSERT INTO documents (text, metadata, embedding) VALUES %s",
+                rows,
+                template="(%s, %s::jsonb, %s::vector)",
+            )
+        self.conn.commit()
 
     def reset(self) -> None:
-        """Clear all stored vectors and texts."""
-        self.index.reset()
-        self.texts.clear()
-        self.metadata.clear()
+        """Delete all rows and reset the ID sequence."""
+        with self.conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE documents RESTART IDENTITY;")
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Search
@@ -84,7 +142,7 @@ class VectorStore:
         top_k: int = 10,
     ) -> list[SearchResult]:
         """
-        Return the top-k most similar documents to a query vector.
+        Return the top-k most similar documents using cosine similarity.
 
         Args:
             query_vector: 1-D float32 array of length embedding_dim.
@@ -93,60 +151,48 @@ class VectorStore:
         Returns:
             List of SearchResult sorted by score descending.
         """
-        query = np.asarray(query_vector, dtype=np.float32)
-        if query.ndim == 1:
-            query = query[np.newaxis, :]
-
-        top_k = min(top_k, len(self.texts))
-        scores, indices = self.index.search(query, top_k)
+        query = np.asarray(query_vector, dtype=np.float32).tolist()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, text, metadata,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM documents
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s;
+                """,
+                (query, query, top_k),
+            )
+            rows = cur.fetchall()
 
         results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
+        for row_id, text, meta, score in rows:
+            if isinstance(meta, str):
+                meta = json.loads(meta)
             results.append(
                 SearchResult(
-                    index=int(idx),
+                    index=int(row_id),
                     score=float(score),
-                    text=self.texts[idx],
-                    metadata=self.metadata[idx],
+                    text=text,
+                    metadata=meta or {},
                 )
             )
         return results
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """Save index and texts to disk (creates <path>.faiss and <path>.npz)."""
-        faiss.write_index(self.index, f"{path}.faiss")
-        np.savez(
-            f"{path}.npz",
-            texts=np.array(self.texts, dtype=object),
-            metadata=np.array(self.metadata, dtype=object),
-        )
-        print(f"Saved {len(self.texts)} vectors to '{path}'")
-
-    @classmethod
-    def load(cls, path: str, embedding_dim: int, metric: str = "cosine") -> VectorStore:
-        """Load a previously saved store from disk."""
-        store = cls(embedding_dim=embedding_dim, metric=metric)
-        store.index = faiss.read_index(f"{path}.faiss")
-        data = np.load(f"{path}.npz", allow_pickle=True)
-        store.texts = list(data["texts"])
-        store.metadata = list(data["metadata"])
-        print(f"Loaded {len(store.texts)} vectors from '{path}'")
-        return store
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.texts)
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM documents;")
+            return cur.fetchone()[0]
 
     def __repr__(self) -> str:
         return (
-            f"VectorStore(items={len(self)}, dim={self.embedding_dim}, metric={self.metric})"
+            f"VectorStore(items={len(self)}, dim={self.embedding_dim}, backend=postgresql)"
         )
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self.conn.close()
